@@ -1,24 +1,24 @@
 from helper_fcns import *
 import csv
+import warnings
 from matplotlib.colors import BoundaryNorm
 from matplotlib.lines import Line2D
 
 class WSINDy:
   def __init__(self, U, alpha, beta, X, V=[], names=None, m=None, p=None, s=None, jacobian = 1.,
-               tau=1e-10, tau_hat=2, init_kc_guess=[10,1,10,0], verbosity=True, rescale=True, eqn_type='pde'):
+               tau=1e-10, tau_hat=2, verbosity=True, rescale=True, eqn_type='pde'):
     self.U = U # state variable
     self.V = V # auxiliary variables
     self.alpha = alpha # derivative multi-indices
     self.beta = beta # monomial multi-indices
-    self.X = X if type(X) == list else [X]
-    self.eqn_type = eqn_type
+    self.X = X if type(X) == list else [X] # coordinate axes
+    self.eqn_type = eqn_type # either 'ode' or 'pde'
 
     self.jacobian = jacobian # dx*...*dt
     self.tau = tau # test function support tolerance
     self.tau_hat = tau_hat # for spectral matching
-    self.verbosity = verbosity
-    self.init_kc_guess = init_kc_guess # for spectral matching
-    self.rescale = rescale
+    self.verbosity = verbosity # prints plots and info
+    self.rescale = rescale # scale-invariant preconditioning
 
     if eqn_type not in ('ode', 'pde'):
       raise ValueError("eqn_type must be 'ode' or 'pde'.")
@@ -37,8 +37,7 @@ class WSINDy:
     self.m = m if m is not None else self.compute_m() # test function support radii
     self.p = p if p is not None else self.compute_p() # test function degrees
     self.s = s if s is not None else [U.shape[i]//100 for i in range(U.ndim)] # subsampling rates
-
-    # Scale-invariant preconditioning
+    
     if rescale:
       [self.yx, self.yt] = self.compute_spatial_scales()
       self.yu = self.compute_u_scale(self.U, self.beta_max)
@@ -53,56 +52,183 @@ class WSINDy:
     [self.axes, self.kernels] = self.build_axes()
     self.test_fcns = self.build_test_fcns()
     self.derivative_names = self.get_derivative_names()
-   
+  
+  ##########################################################################################################
+  # AUTOMATIC HYPERPARAMETER SELECTION
+  ##########################################################################################################
+
   def compute_m(self):
-    m = [self.spectral_matching(d, changepoint, F_root) for d in range(self.U.dim())]
-    return m
+    return [self.spectral_matching(d) for d in range(self.U.dim())]
 
   def compute_p(self):
     p = [compute_degrees(d, md, self.alpha, tau=self.tau) for d,md in enumerate(self.m)]
     return p
 
-  # Determines bandwidth of test functions by estimating signal-dominated modes
-  def spectral_matching(self, d, changepoint, F_root):
+  def _validate_spectral_inputs(self, d):
+    if not isinstance(d, int) or not (0 <= d < self.U.dim()):
+      raise ValueError(f"Invalid spectral-matching axis: {d}.")
+    if not np.isfinite(self.tau) or not (0 < self.tau < 1):
+      raise ValueError("tau must lie strictly between 0 and 1.")
+    if not np.isfinite(self.tau_hat) or self.tau_hat <= 0:
+      raise ValueError("tau_hat must be positive and finite.")
+    if torch.is_complex(self.U):
+      raise ValueError("Spectral matching requires real-valued data.")
+    if not torch.isfinite(self.U).all().item():
+      raise ValueError("Spectral matching requires finite data.")
+
     Nd = self.U.shape[d]
-    Uhat_d = abs(torch.fft.rfft(self.U, n=Nd, dim=d))
-    dims = [dim for dim in range(Uhat_d.ndimension()) if dim != d]
-    Uhat_d = Uhat_d.mean(dim = dims) if dims else Uhat_d
+    if Nd < 5:
+      raise ValueError("Spectral matching requires at least five samples per axis.")
+    if len(self.X) != self.U.dim():
+      raise ValueError("The number of coordinate axes must match the data dimensions.")
 
-    Hd = torch.cumsum(Uhat_d, dim=0) # Cumulative sum
-    Hd = (Hd/Hd.max()).numpy() # Normalize for curve fitting
+    axis = self.X[d]
+    if not isinstance(axis, torch.Tensor):
+      axis = torch.as_tensor(axis)
+    if axis.ndim != 1 or axis.numel() != Nd:
+      raise ValueError(f"Coordinate axis {d} must be one-dimensional with {Nd} entries.")
+    if torch.is_complex(axis) or not torch.isfinite(axis).all().item():
+      raise ValueError(f"Coordinate axis {d} must be real and finite.")
 
-    # Solve change-point problem
-    freqs = torch.arange(0, np.floor(Nd/2)+1, 1).numpy()
-    params = scipy.optimize.curve_fit(changepoint, freqs, Hd, p0=self.init_kc_guess)[0]
-    k = int(params[0])
+    axis64 = axis.detach().to(dtype=torch.float64)
+    spacing = torch.diff(axis64)
+    if not torch.all(spacing > 0).item():
+      raise ValueError(f"Coordinate axis {d} must be strictly increasing.")
+    atol = 1e-12*max(abs(spacing[0].item()), 1.)
+    if not torch.allclose(spacing, torch.full_like(spacing, spacing[0]),
+                          rtol=1e-5, atol=atol):
+      raise ValueError(f"Coordinate axis {d} must be uniformly spaced for FFT matching.")
+    return Nd
 
-    # Solve root-finding problem
-    guess = (np.sqrt(3)*Nd*self.tau_hat)/(2*np.pi*k)
-    guess = guess * (1 + np.sqrt(1 - (8/np.sqrt(3))*np.log(self.tau)))/2
-    md = int(scipy.optimize.root(F_root, guess, args=(k,Nd,self.tau_hat,self.tau)).x[0])
+  def _spectral_fallback(self, d, reason, m_max):
+    warnings.warn(f"spectral_matching (axis {d}): {reason}; using fallback "
+                  f"support radius m={m_max}. Consider passing m explicitly.",
+                  RuntimeWarning, stacklevel=2)
+    return m_max
+
+  # Determine a test-function support radius by matching its Fourier decay to
+  # the signal/noise changepoint, following Appendix A and findcorners.m.
+  def spectral_matching(self, d):
+    Nd = self._validate_spectral_inputs(d)
+    m_max = (Nd-1) // 2
+
+    spectrum = reference_half_spectrum(self.U, d)
+    if (not torch.isfinite(spectrum).all().item()
+        or spectrum.numel() < 3
+        or spectrum.sum().item() <= 0):
+      return self._spectral_fallback(d, "zero or degenerate spectrum", m_max)
+
+    Hd = torch.cumsum(spectrum, dim=0)
+    if not torch.all(Hd > 0).item():
+      return self._spectral_fallback(d, "undefined relative spectral weights", m_max)
+
+    try:
+      kc, _, _ = reference_changepoint(Hd)
+    except (ValueError, RuntimeError, FloatingPointError) as error:
+      return self._spectral_fallback(d, f"failed changepoint fit ({error})", m_max)
+
+    existence_value = (np.sqrt(3)/np.pi) * (self.tau_hat/kc)
+    if not ((4/Nd) <= existence_value <= 1):
+      return self._spectral_fallback(
+        d, "the Appendix A root-existence condition is not satisfied", m_max)
+
+    lower,upper = support_bracket(kc, Nd, self.tau_hat, self.tau)
+    F_lower = F_root(lower, kc, Nd, self.tau_hat, self.tau)
+    F_upper = F_root(upper, kc, Nd, self.tau_hat, self.tau)
+    if (not np.isfinite(F_lower) or not np.isfinite(F_upper)
+        or F_lower < 0 or F_upper > 0):
+      return self._spectral_fallback(d, "support-radius bracket does not change sign", m_max)
+
+    try:
+      md_fit,result = scipy.optimize.brentq(
+        F_root, lower, upper, args=(kc,Nd,self.tau_hat,self.tau),
+        full_output=True, disp=False)
+    except (ValueError, RuntimeError, OverflowError, FloatingPointError) as error:
+      return self._spectral_fallback(d, f"support-radius solve failed ({error})", m_max)
+
+    scale = max(abs(F_lower), abs(F_upper), 1.)
+    residual = abs(F_root(md_fit, kc, Nd, self.tau_hat, self.tau))
+    if not result.converged or not np.isfinite(md_fit) or residual > 1e-8*scale:
+      return self._spectral_fallback(d, "support-radius solve did not converge", m_max)
+
+    md = int(np.ceil(md_fit))
+    if not (2 <= md <= m_max):
+      return self._spectral_fallback(d, "support-radius root is outside the valid range", m_max)
 
     if self.verbosity:
-      plt.figure(figsize=(7,2))
-      Uhat_d = Uhat_d.numpy()
+      if Nd % 2 == 0:
+        modes = torch.arange(Nd//2, 0, -1)
+      else:
+        modes = torch.arange(Nd//2, -1, -1)
+      modes = modes.numpy()
+      spectrum_np = spectrum.detach().cpu().numpy()
       label = r'$|\mathcal{F}[u]|(k)$' if self.eqn_type == 'ode' else r'$|\mathcal{F}_{x_d}[u]|(k)$'
-      plt.plot(freqs, Uhat_d, '.-')
-      plt.axvline(params[0], ls='--', color='r', label=r'Estimated changepoint, $\hat{k}_d$')
+
+      plt.figure(figsize=(7,2))
+      plt.plot(modes, spectrum_np, '.-')
+      plt.axvline(kc, ls='--', color='r', label=r'Estimated changepoint, $\hat{k}_d$')
       plt.xlabel('Wavenumber, $k$')
       plt.ylabel(label)
       plt.title(fr'Spectral matching: $\hat{{m}}_d={md}$ (axis: $d=${d})')
-      plt.legend(loc = 'upper right', framealpha=0.8, fontsize=11)
+      plt.legend(loc='upper right', framealpha=0.8, fontsize=11)
       plt.yscale('log')
       plt.grid(True, alpha=0.3, color='silver')
       plt.show()
     return md
+  
+  # # Determines support radius md in [mx,...,mt] of test fcn by estimating signal-dominated Fourier modes
+  # def spectral_matching(self, d, changepoint, F_root):
+  #   Nd = self.U.shape[d]
+  #   Uhat_d = abs(torch.fft.rfft(self.U, n=Nd, dim=d))
+  #   dims = [dim for dim in range(Uhat_d.ndimension()) if dim != d]
+  #   Uhat_d = Uhat_d.mean(dim = dims) if dims else Uhat_d
+
+  #   Hd = torch.cumsum(Uhat_d, dim=0) # Cumulative sum
+  #   Hd = (Hd/Hd.max()).numpy() # Normalize for curve fitting
+
+  #   # Estimate wavenumber kc at which spectrum becomes noise-dominated
+  #   freqs = torch.arange(0, np.floor(Nd/2)+1, 1).numpy()
+  #   params = scipy.optimize.curve_fit(changepoint, freqs, Hd, p0=self.init_kc_guess)[0]
+  #   kc = int(params[0]) if np.isfinite(params[0]) else 0
+  #   degenerate = kc < 1 # Flags a non-physical wavenumber
+  #   kc = max(kc, 1)
+
+  #   # Solve root-finding problem
+  #   guess = (np.sqrt(3)*Nd*self.tau_hat)/(2*np.pi*kc)
+  #   guess = guess * (1 + np.sqrt(1 - (8/np.sqrt(3))*np.log(self.tau)))/2
+  #   md_fit = scipy.optimize.root(F_root, guess, args=(kc,Nd,self.tau_hat,self.tau)).x[0]
+  #   md = int(md_fit) if np.isfinite(md_fit) else None
+
+  #   # Clamp support radius to the valid range
+  #   m_max = (Nd-1) // 2
+  #   if md is None or not (2 <= md <= m_max):
+  #   md = int(np.clip(md_fit, 2, m_max)) if np.isfinite(md_fit) else m_max
+  #   degenerate = True
+  #   if degenerate:
+  #   warnings.warn(f"spectral_matching (axis {d}): degenerate change-point fit; "
+  #   f"using fallback support radius m={md}. Consider passing m explicitly.")
+
+  #   if self.verbosity:
+  #   plt.figure(figsize=(7,2))
+  #   Uhat_d = Uhat_d.numpy()
+  #   label = r'$|\mathcal{F}[u]|(k)$' if self.eqn_type == 'ode' else r'$|\mathcal{F}_{x_d}[u]|(k)$'
+  #   plt.plot(freqs, Uhat_d, '.-')
+  #   plt.axvline(kc, ls='--', color='r', label=r'Estimated changepoint, $\hat{k}_d$')
+  #   plt.xlabel('Wavenumber, $k$')
+  #   plt.ylabel(label)
+  #   plt.title(fr'Spectral matching: $\hat{{m}}_d={md}$ (axis: $d=${d})')
+  #   plt.legend(loc = 'upper right', framealpha=0.8, fontsize=11)
+  #   plt.yscale('log')
+  #   plt.grid(True, alpha=0.3, color='silver')
+  #   plt.show()
+  #   return md
 
   # Compute mask of query point indices, U[mask] = U[xk,...,tk]
   def compute_query_points(self):
     subsamples = [subsample(self.s[i], self.m[i], self.X[i]) for i in range(self.U.ndim)]
     cartesian_prod = itertools.product(*subsamples)
     mask = tuple(map(torch.tensor, zip(*cartesian_prod))) # for tensors
-    flat_mask = tuple([mask[i]-self.m[i] for i in range(self.U.ndim)]) # for vectorized quantities
+    flat_mask = tuple([mask[i]-self.m[i] for i in range(self.U.ndim)]) # flattens tensors
 
     if self.verbosity:
       if self.eqn_type == 'ode':
@@ -134,6 +260,10 @@ class WSINDy:
         plt.legend(loc='upper right')
         plt.show()
     return mask, flat_mask
+  
+  ##########################################################################################################
+  # SCALE-INVARIANT PRECONDITIONING
+  ##########################################################################################################
 
   # Compute scale for a state variable, yu
   def compute_u_scale(self, u, beta_max):
@@ -182,26 +312,9 @@ class WSINDy:
         mu[j] = (yu_term * yx_term * yt_term)/self.yu
     return mu
 
-  # Returns symbolic derivatives
-  def get_derivative_names(self):
-    D = self.U.dim() - 1
-    derivative_names = []
-    for elem in self.alpha:
-      if all(value == 0 for value in elem):
-        derivative_names.append('')
-      else:
-        # (0+1)-D, (1+1)-D, (2+1)-D, (3+1)-D case-handling
-        if D == 0:
-          derivative_names.append('_{'+'t'*elem[0]+'}') # for ODEs
-        elif D == 1:
-          derivative_names.append('_{'+'t'*elem[1]+'x'*elem[0]+'}')
-        elif D == 2:
-          derivative_names.append('_{'+'t'*elem[2]+'x'*elem[0]+'y'*elem[1]+'}')
-        elif D == 3:
-          derivative_names.append('_{'+'t'*elem[3]+'x'*elem[0]+'y'*elem[1]+'z'*elem[2]+'}')
-        else:
-          raise ValueError("Whoah! Spatial dimension can only be: 0, 1, 2, or 3.")
-    return derivative_names
+  ##########################################################################################################
+  # TEST FUNCTION CONSTRUCTION
+  ##########################################################################################################
 
   # Compute test function and its derivatives along d-th axis
   def get_weight_fcns(self, d):
@@ -268,6 +381,10 @@ class WSINDy:
       D_phi = torch.einsum(einsum, *axes)
       test_fcns.append(D_phi)
     return test_fcns
+  
+  ##########################################################################################################
+  # BUILD WSINDY LINEAR SYSTEM (Gw = b)
+  ##########################################################################################################
 
   # Weak time derivative
   def build_lhs(self, lhs_name):
@@ -307,19 +424,7 @@ class WSINDy:
           G.append(term[self.flat_mask])
           rhs_names.append(name)
     return G, powers, derivs, rhs_names
-
-  # Fancy monomial formatting
-  def format_monomial(self, bj):
-    terms = []
-    for d in range(len(bj)):
-      if bj[d] == 0:
-        continue
-      if bj[d] == 1:
-        terms.append(self.names[d])
-      else:
-        terms.append(f'{self.names[d]}^{bj[d]}')
-    return '(' + ' '.join(terms) + ')' if terms else '(1)'
-
+  
   def set_library(self, G, powers, derivs, rhs_names):
     G = torch.stack(G, dim=1)
     if G.shape[0] != len(self.mask[0]):
@@ -329,10 +434,14 @@ class WSINDy:
     if self.rescale:
       self.mu = self.compute_scale_matrix(powers, derivs)
     return
+  
+  ##########################################################################################################
+  # SPARSE REGRESSION
+  ##########################################################################################################
 
   # Full MSTLS optimization routine, scans through Lambdas
-  #def MSTLS(self, Lambda=None, Lambdas=10**((4/49)*torch.arange(0,50)-4)):
   def MSTLS(self, Lambda=None, Lambdas=10**((3/99)*torch.arange(0,100)-3)):
+  #def MSTLS(self, Lambda=None, Lambdas=10**((4/49)*torch.arange(0,50)-4)):
     w_LS = la.lstsq(self.library, self.lhs, driver='gelsd').solution
 
     if Lambda is not None:
@@ -381,6 +490,43 @@ class WSINDy:
 
     loss_n = loss(w_n, w_LS, G)
     return w_n, loss_n
+  
+  ##########################################################################################################
+  # OUTPUT AND FORMATTING
+  ##########################################################################################################
+  
+  # Returns symbolic derivatives
+  def get_derivative_names(self):
+    D = self.U.dim() - 1
+    derivative_names = []
+    for elem in self.alpha:
+      if all(value == 0 for value in elem):
+        derivative_names.append('')
+      else:
+        # (0+1)-D, (1+1)-D, (2+1)-D, (3+1)-D case-handling
+        if D == 0:
+          derivative_names.append('_{'+'t'*elem[0]+'}') # for ODEs
+        elif D == 1:
+          derivative_names.append('_{'+'t'*elem[1]+'x'*elem[0]+'}')
+        elif D == 2:
+          derivative_names.append('_{'+'t'*elem[2]+'x'*elem[0]+'y'*elem[1]+'}')
+        elif D == 3:
+          derivative_names.append('_{'+'t'*elem[3]+'x'*elem[0]+'y'*elem[1]+'z'*elem[2]+'}')
+        else:
+          raise ValueError("Whoah! Spatial dimension can only be: 0, 1, 2, or 3.")
+    return derivative_names
+
+  # Fancy monomial formatting
+  def format_monomial(self, bj):
+    terms = []
+    for d in range(len(bj)):
+      if bj[d] == 0:
+        continue
+      if bj[d] == 1:
+        terms.append(self.names[d])
+      else:
+        terms.append(f'{self.names[d]}^{bj[d]}')
+    return '(' + ' '.join(terms) + ')' if terms else '(1)'
 
   # Prints a report of the WSINDy run
   def print_report(self):
@@ -420,6 +566,10 @@ class WSINDy:
     print(f'Lambda = {self.Lambda:.2e}')
     print(f'Loss = {self.loss:.3f}')
     return
+  
+  ##########################################################################################################
+  # HYPERPARAMETER SWEEP
+  ##########################################################################################################
 
   # Sweep hyperparameters (m, Lambda) with rescale = True/False
   def hyperparameter_sweep(self, lhs_name=None, m_values=None, Lambdas=None, rescales=(True, False),
@@ -451,7 +601,7 @@ class WSINDy:
     for m in tqdm(m_values):
       for rescale in rescales:
         model = WSINDy(self.U, self.alpha, self.beta, self.X, V=self.V, names=self.names, m=m, s=s, jacobian=self.jacobian, tau=self.tau,
-                       tau_hat=self.tau_hat, init_kc_guess=self.init_kc_guess, verbosity=False, rescale=rescale, eqn_type=self.eqn_type)
+                       tau_hat=self.tau_hat, verbosity=False, rescale=rescale, eqn_type=self.eqn_type)
         if library_fcn is None:
           [G, powers, derivs, rhs_names] = model.create_default_library()
         else:

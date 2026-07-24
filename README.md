@@ -102,13 +102,17 @@ params = {
     'p': None,         # Test fcn degrees [px,...,pt]
     's': None,         # Subsampling [sx,...,st]
     'jacobian': 1.,    # Volume element
-    'tau': 1e-10,      # Test fcn tolerance
-    'tau_hat': 2,      # Fourier test fcn tolerance
+    'tau': 1e-10,      # Test fcn tolerance in real space
+    'tau_hat': 2,      # Fourier decay in standard deviations
     'verbosity': True, # Print out details
     'rescale': True,   # Use preconditioner for LS solves
-    'init_guess': [10,1,10,0], # [x0, y0, m1, m2], for (kx,kt) curve fit
 }
 ```
+
+When `m` is omitted, spectral matching uses `tau_hat=2` by default and checks
+that the learned changepoint satisfies the root-existence condition from
+Appendix A. Degenerate spectra fall back to the largest valid support with a
+warning; pass `m` explicitly to bypass automatic matching.
 
 ###### Create library of candidate terms and solve for sparse coefficients:
 ```python3

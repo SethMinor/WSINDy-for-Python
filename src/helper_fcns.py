@@ -12,9 +12,145 @@ from scipy.special import factorial
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# Two-piece linear approximation
-def changepoint(x, x0, y0, m1, m2):
-    return np.piecewise(x, [x<x0], [lambda x:m1*(x-x0)+y0, lambda x:m2*(x-x0)+y0])
+# Reconstruct the half-spectrum used by the reference MATLAB changepoint
+# routine from the nonnegative-frequency FFT of real-valued data.
+def reference_half_spectrum(U, d):
+  N = U.shape[d]
+  U64 = U.detach().to(dtype=torch.float64)
+  spectrum = torch.abs(torch.fft.rfft(U64, n=N, dim=d))
+  mean_dims = tuple(dim for dim in range(spectrum.ndim) if dim != d)
+  if mean_dims:
+    spectrum = spectrum.mean(dim=mean_dims)
+
+  # fftshift(fft(U)) starts at the negative Nyquist mode. For real data,
+  # conjugate symmetry makes its retained negative-frequency half exactly the
+  # following reversal of rfft magnitudes.
+  if N % 2 == 0:
+    return torch.flip(spectrum[1:], dims=(0,))  # -N/2, ..., -1
+  return torch.flip(spectrum, dims=(0,))        # -(N-1)/2, ..., 0
+
+
+# Direct O(N^2) implementation of the reference relative-error objective.
+# This is used to verify or fall back from the optimized prefix-sum formula.
+def _direct_reference_scores(H, candidates=None):
+  N = H.numel()
+  x = torch.arange(N, dtype=H.dtype, device=H.device)
+  if candidates is None:
+    candidates = torch.arange(1, N-1, dtype=torch.long, device=H.device)
+
+  scores = []
+  for candidate in candidates:
+    j = int(candidate.item())
+    slope1 = (H[j] - H[0]) / j
+    line1 = H[0] + slope1*x[:j+1]
+
+    slope2 = (H[-1] - H[j]) / (N-1-j)
+    line2 = H[-1] + slope2*(x[j:] - (N-1))
+
+    error1 = ((line1 - H[:j+1]) / H[:j+1])**2
+    error2 = ((line2 - H[j:]) / H[j:])**2
+    scores.append(error1.sum() + error2.sum())
+  return torch.stack(scores)
+
+
+# Evaluate the reference MATLAB changepoint objective in O(N) time using
+# prefix sums. Returns (critical wavenumber, split index, scores).
+def reference_changepoint(H):
+  if H.ndim != 1 or H.numel() < 3:
+    raise ValueError("Cumulative spectrum must be one-dimensional with at least three entries.")
+  if not torch.isfinite(H).all().item() or not torch.all(H > 0).item():
+    raise ValueError("Cumulative spectrum has undefined relative weights.")
+  if not torch.all(H[1:] >= H[:-1]).item():
+    raise ValueError("Cumulative spectrum must be nondecreasing.")
+
+  H = H.to(dtype=torch.float64)
+  N = H.numel()
+  # The reference Fourier coordinates are an affine scaling of these indices;
+  # endpoint-interpolating lines have identical relative residuals either way.
+  x = torch.arange(N, dtype=H.dtype, device=H.device)
+  candidates = torch.arange(1, N-1, dtype=torch.long, device=H.device)
+  j = candidates.to(dtype=H.dtype)
+
+  inv_H = 1/H
+  inv_H2 = inv_H**2
+  P0 = torch.cumsum(inv_H2, dim=0)
+  P1 = torch.cumsum(x*inv_H2, dim=0)
+  P2 = torch.cumsum((x**2)*inv_H2, dim=0)
+  Q0 = torch.cumsum(inv_H, dim=0)
+  Q1 = torch.cumsum(x*inv_H, dim=0)
+
+  slope1 = (H[candidates] - H[0]) / j
+  intercept1 = torch.full_like(slope1, H[0])
+  slope2 = (H[-1] - H[candidates]) / (N-1-j)
+  intercept2 = H[-1] - slope2*(N-1)
+
+  def expanded_error(a, b, S0, S1, S2, T0, T1, count):
+    terms = torch.stack((
+      a**2*S0,
+      2*a*b*S1,
+      b**2*S2,
+      -2*a*T0,
+      -2*b*T1,
+      count,
+    ))
+    return terms.sum(dim=0), torch.abs(terms).sum(dim=0)
+
+  count1 = j + 1
+  error1, magnitude1 = expanded_error(
+    intercept1, slope1,
+    P0[candidates], P1[candidates], P2[candidates],
+    Q0[candidates], Q1[candidates], count1)
+
+  previous = candidates - 1
+  count2 = N - j
+  error2, magnitude2 = expanded_error(
+    intercept2, slope2,
+    P0[-1]-P0[previous], P1[-1]-P1[previous], P2[-1]-P2[previous],
+    Q0[-1]-Q0[previous], Q1[-1]-Q1[previous], count2)
+
+  scores = error1 + error2
+  eps = torch.finfo(H.dtype).eps
+  roundoff_bound = 64*eps*(magnitude1 + magnitude2)
+
+  # A materially negative or nonfinite expanded score indicates catastrophic
+  # cancellation. Fall back to the direct reference computation in that case.
+  inconsistent = (~torch.isfinite(scores)) | (scores < -roundoff_bound)
+  if inconsistent.any().item():
+    scores = _direct_reference_scores(H, candidates)
+  else:
+    scores = torch.clamp_min(scores, 0.)
+
+    # Verify the provisional winner directly. If the expanded score is not
+    # consistent with the direct residual, recompute every candidate.
+    winner = int(torch.argmin(scores).item())
+    direct_winner = _direct_reference_scores(H, candidates[winner:winner+1])[0]
+    tolerance = 8*roundoff_bound[winner] + 64*eps*(1 + torch.abs(direct_winner))
+    if (not torch.isfinite(direct_winner).item()
+        or torch.abs(scores[winner] - direct_winner) > tolerance):
+      scores = _direct_reference_scores(H, candidates)
+    else:
+      scores[winner] = direct_winner
+
+      # Resolve candidates whose prefix-sum uncertainty overlaps the winning
+      # score. This preserves the reference routine's first-minimum behavior
+      # for exact or near ties without giving up O(N) work in the usual case.
+      possible = torch.where(scores - roundoff_bound <= direct_winner + tolerance)[0]
+      if possible.numel() > 1:
+        scores[possible] = _direct_reference_scores(H, candidates[possible])
+
+  if not torch.isfinite(scores).all().item():
+    raise ValueError("No finite reference changepoint score was found.")
+
+  winner = int(torch.argmin(scores).item())
+  split_index = int(candidates[winner].item())
+  critical_wavenumber = max(N - split_index - 3, 1)
+  return critical_wavenumber, split_index, scores
+
+
+def support_bracket(k, N, tau_hat, tau):
+  lower = (np.sqrt(3)/np.pi) * (N/2) * (tau_hat/k)
+  upper = lower * np.sqrt(1 - (8/np.sqrt(3))*np.log(tau))
+  return lower,upper
 
 # Function used in spectral matching
 def F_root(m,k,N,tau_hat,tau):

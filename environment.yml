@@ -10,6 +10,7 @@ dependencies:
   - matplotlib
   - ipython
   - jupyter
+  - pytest
   - pip
   - pytorch
   - cpuonly
@@ -17,3 +18,4 @@ dependencies:
   - h5py
   - pip:
     - symengine
+    - dysts
