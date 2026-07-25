@@ -65,9 +65,7 @@ class WSINDy:
     return p
 
   def _validate_spectral_inputs(self, d):
-    if not isinstance(d, int) or not (0 <= d < self.U.dim()):
-      raise ValueError(f"Invalid spectral-matching axis: {d}.")
-    if not np.isfinite(self.tau) or not (0 < self.tau < 1):
+    if not (0 < self.tau < 1):
       raise ValueError("tau must lie strictly between 0 and 1.")
     if not np.isfinite(self.tau_hat) or self.tau_hat <= 0:
       raise ValueError("tau_hat must be positive and finite.")

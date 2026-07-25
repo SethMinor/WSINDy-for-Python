@@ -12,6 +12,8 @@ from scipy.special import factorial
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+import warnings
+
 # Reconstruct the half-spectrum used by the reference MATLAB changepoint
 # routine from the nonnegative-frequency FFT of real-valued data.
 def reference_half_spectrum(U, d):
@@ -158,6 +160,12 @@ def F_root(m,k,N,tau_hat,tau):
   mid_term = (2*np.pi*k*m)**2 - 3*(tau_hat*N)**2
   last_term = 2*(tau_hat*N)**2 * np.log(tau)
   return log_term * mid_term - last_term
+
+def _spectral_fallback(self, d, reason, m_max):
+    warnings.warn(f"spectral_matching (axis {d}): {reason}; using fallback "
+                  f"support radius m={m_max}. Consider passing m explicitly.",
+                  RuntimeWarning, stacklevel=2)
+    return m_max
 
 # Compute test function degrees given support radii
 def compute_degrees(d, m, alpha, tau=1.e-10):
